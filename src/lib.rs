@@ -619,14 +619,17 @@ fn read_snapshot_and_apply_logs(
     log_ids: BTreeSet<u64>,
     snapshot_id_opt: Option<u64>,
 ) -> io::Result<Recovery> {
-    let snapshot: FnvHashMap<u64, (NonZeroU64, InlineArray)> =
-        if let Some(snapshot_id) = snapshot_id_opt {
-            read_snapshot(&path, snapshot_id)?.0
-        } else {
-            Default::default()
-        };
-
-    let mut recovered = snapshot;
+    let (snapshot_tx, snapshot_rx) = mpsc::channel();
+    if let Some(snapshot_id) = snapshot_id_opt {
+        let path: PathBuf = path.into();
+        rayon::spawn(move || {
+            let snap_res =
+                read_snapshot(&path, snapshot_id).map(|(snapshot, _snapshot_len)| snapshot);
+            snapshot_tx.send(snap_res).unwrap();
+        });
+    } else {
+        snapshot_tx.send(Ok(Default::default())).unwrap();
+    }
 
     let mut max_log_id = snapshot_id_opt.unwrap_or(0);
 
@@ -643,6 +646,8 @@ fn read_snapshot_and_apply_logs(
                 Ok((*log_id, log_datum))
             })
             .collect();
+
+    let mut recovered: FnvHashMap<u64, (NonZeroU64, InlineArray)> = snapshot_rx.recv().unwrap()?;
 
     for (log_id, log_datum) in log_data_res? {
         max_log_id = max_log_id.max(log_id);
