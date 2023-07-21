@@ -1,5 +1,5 @@
 [package]
-name = "u64db"
+name = "metadata-store"
 version = "0.1.0"
 edition = "2021"
 
@@ -10,6 +10,7 @@ crc32fast = "1.3.2"
 fault-injection = "1.0.9"
 fnv = "1.0.7"
 fs2 = "0.4.3"
+inline-array = { version = "0.1.11", features = ["serde", "concurrent_map_minimum"] }
 log = "0.4.19"
 pagetable = "0.4.3"
 rayon = "1.7.0"

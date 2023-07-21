@@ -1,8 +1,3 @@
-// TODO have writer try to compact multiple log segments at a time
-// TODO use write + fsync + mv + fsync for snapshot
-// TODO logs can contain 0 for value, but not the snapshot (no tombstone in last level)
-// TODO use annotate/fallible/maybe in some places where ? is used
-
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -15,7 +10,7 @@ use std::sync::{
 
 use fault_injection::{annotate, fallible, maybe};
 use fnv::{FnvHashMap, FnvHashSet};
-use pagetable::PageTable;
+use inline_array::InlineArray;
 use rayon::prelude::*;
 use zstd::stream::read::Decoder as ZstdDecoder;
 use zstd::stream::write::Encoder as ZstdEncoder;
@@ -28,14 +23,25 @@ const HEAP_PREFIX: &str = "heap";
 
 const ZSTD_LEVEL: i32 = 3;
 
-#[derive(Clone)]
-pub struct U64Db {
+pub struct MetadataStore {
     inner: Inner,
+    is_shut_down: bool,
+}
+
+impl Drop for MetadataStore {
+    fn drop(&mut self) {
+        if self.is_shut_down {
+            return;
+        }
+
+        self.shutdown_inner();
+        self.is_shut_down = true;
+    }
 }
 
 struct Recovery {
-    recovered: Vec<(u64, NonZeroU64)>,
-    free: FnvHashSet<u64>,
+    recovered: Vec<(u64, NonZeroU64, InlineArray)>,
+    free: Vec<u64>,
     highest_key: u64,
     id_for_next_log: u64,
     snapshot_size: u64,
@@ -122,7 +128,7 @@ fn worker(mut rx: mpsc::Receiver<WorkerMessage>, mut last_snapshot_lsn: u64, inn
             Err(Some(tx)) => {
                 drop(inner);
                 if let Err(e) = tx.send(()) {
-                    log::error!("log compactor failed to send shutdown ack to system");
+                    log::error!("log compactor failed to send shutdown ack to system: {e:?}");
                 }
                 return;
             }
@@ -158,11 +164,11 @@ fn set_error(global_error: &AtomicPtr<(io::ErrorKind, String)>, error: &io::Erro
 
 #[derive(Clone)]
 struct Inner {
-    pt: PageTable<AtomicU64>,
     global_error: Arc<AtomicPtr<(io::ErrorKind, String)>>,
     active_log: Arc<Mutex<LogAndStats>>,
     snapshot_size: Arc<AtomicU64>,
     storage_directory: PathBuf,
+    #[allow(unused)]
     directory_lock: Arc<fs::File>,
     worker_outbox: mpsc::Sender<WorkerMessage>,
 }
@@ -178,8 +184,12 @@ impl Drop for Inner {
     }
 }
 
-impl U64Db {
-    pub fn shutdown(self) {
+impl MetadataStore {
+    pub fn shutdown(mut self) {
+        self.shutdown_inner();
+    }
+
+    fn shutdown_inner(&mut self) {
         let (tx, rx) = mpsc::channel();
         if self
             .inner
@@ -194,6 +204,8 @@ impl U64Db {
             io::ErrorKind::Other,
             "system has been shut down".to_string(),
         ));
+
+        self.is_shut_down = true;
     }
 
     fn check_error(&self) -> io::Result<()> {
@@ -212,7 +224,18 @@ impl U64Db {
         set_error(&self.inner.global_error, error);
     }
 
-    pub fn recover<P: AsRef<Path>>(storage_directory: P) -> io::Result<U64Db> {
+    /// Returns the writer handle `MetadataStore`, a sorted array of metadata, and a sorted array
+    /// of free keys.
+    pub fn recover<P: AsRef<Path>>(
+        storage_directory: P,
+    ) -> io::Result<(
+        // Metadata writer
+        MetadataStore,
+        // Metadata - key, value, user data
+        Vec<(u64, NonZeroU64, InlineArray)>,
+        // Free keys
+        Vec<u64>,
+    )> {
         use fs2::FileExt;
 
         let path = storage_directory.as_ref();
@@ -220,7 +243,7 @@ impl U64Db {
         // initialize directories if not present
         if let Err(e) = fs::read_dir(&path) {
             if e.kind() == io::ErrorKind::NotFound {
-                let _ = fs::create_dir_all(&path);
+                fallible!(fs::create_dir_all(&path));
             }
         }
 
@@ -229,7 +252,7 @@ impl U64Db {
         let directory_lock = fallible!(fs::File::open(path));
         fallible!(directory_lock.try_lock_exclusive());
 
-        let recovery = U64Db::recover_inner(&storage_directory)?;
+        let recovery = MetadataStore::recover_inner(&storage_directory)?;
 
         let new_log = LogAndStats {
             log_sequence_number: recovery.id_for_next_log,
@@ -237,17 +260,9 @@ impl U64Db {
             file: fallible!(fs::File::create(log_path(path, recovery.id_for_next_log))),
         };
 
-        let pt = PageTable::<AtomicU64>::default();
-        for (k, v) in &recovery.recovered {
-            pt.get(*k).store(v.get(), Ordering::Relaxed);
-        }
-
-        std::sync::atomic::fence(Ordering::SeqCst);
-
         let (tx, rx) = mpsc::channel();
 
         let inner = Inner {
-            pt,
             snapshot_size: Arc::new(recovery.snapshot_size.into()),
             storage_directory: path.into(),
             directory_lock: Arc::new(directory_lock),
@@ -265,7 +280,14 @@ impl U64Db {
             )
         });
 
-        Ok(U64Db { inner })
+        Ok((
+            MetadataStore {
+                inner,
+                is_shut_down: false,
+            },
+            recovery.recovered,
+            recovery.free,
+        ))
     }
 
     /// Returns the recovered mappings, the id for the next log file, the highest allocated object id, and the set of free ids
@@ -282,22 +304,15 @@ impl U64Db {
         read_snapshot_and_apply_logs(path, log_ids, snapshot_id_opt)
     }
 
-    pub fn get(&self, key: u64) -> io::Result<u64> {
+    /// Write a batch of metadata. `None` for the second half of the outer tuple represents a
+    /// deletion.
+    pub fn insert_batch<I: IntoIterator<Item = (u64, Option<(NonZeroU64, InlineArray)>)>>(
+        &self,
+        batch: I,
+    ) -> io::Result<()> {
         self.check_error()?;
 
-        Ok(self.inner.pt.get(key).load(Ordering::Acquire))
-    }
-
-    pub fn insert_batch<I: IntoIterator<Item = (u64, u64)>>(&self, batch: I) -> io::Result<()> {
-        self.check_error()?;
-
-        let pt_adder = batch.into_iter().map(|(k, v)| {
-            self.inner.pt.get(k).store(v, Ordering::Relaxed);
-            (k, v)
-        });
-        let batch_bytes = serialize_batch(pt_adder);
-
-        std::sync::atomic::fence(Ordering::Release);
+        let batch_bytes = serialize_batch(batch);
 
         let mut log = self.inner.active_log.lock().unwrap();
 
@@ -327,7 +342,13 @@ impl U64Db {
             let mut next_log_file_opts = fs::OpenOptions::new();
             next_log_file_opts.create(true).read(true).write(true);
 
-            let next_log_file = fallible!(next_log_file_opts.open(next_path));
+            let next_log_file = match maybe!(next_log_file_opts.open(next_path)) {
+                Ok(nlf) => nlf,
+                Err(e) => {
+                    self.set_error(&e);
+                    return Err(e);
+                }
+            };
 
             let next_log_and_stats = LogAndStats {
                 file: next_log_file,
@@ -351,7 +372,9 @@ impl U64Db {
     }
 }
 
-fn serialize_batch<I: IntoIterator<Item = (u64, u64)>>(batch: I) -> Vec<u8> {
+fn serialize_batch<I: IntoIterator<Item = (u64, Option<(NonZeroU64, InlineArray)>)>>(
+    batch: I,
+) -> Vec<u8> {
     // we initialize the vector to contain placeholder bytes for the frame length
     let batch_bytes = 0_u64.to_le_bytes().to_vec();
 
@@ -364,9 +387,22 @@ fn serialize_batch<I: IntoIterator<Item = (u64, u64)>>(batch: I) -> Vec<u8> {
     //  LE encoded crc32 of length + payload raw bytes, XOR 0xAF to make non-zero in empty case
     let mut batch_encoder = ZstdEncoder::new(batch_bytes, ZSTD_LEVEL).unwrap();
 
-    for (k, v) in batch {
+    for (k, v_opt) in batch {
         batch_encoder.write_all(&k.to_le_bytes()).unwrap();
-        batch_encoder.write_all(&v.to_le_bytes()).unwrap();
+        if let Some((v, user_data)) = v_opt {
+            batch_encoder.write_all(&v.get().to_le_bytes()).unwrap();
+
+            let user_data_len: u64 = user_data.len() as u64;
+            batch_encoder
+                .write_all(&user_data_len.to_le_bytes())
+                .unwrap();
+            batch_encoder.write_all(&user_data).unwrap();
+        } else {
+            // v
+            batch_encoder.write_all(&0_u64.to_le_bytes()).unwrap();
+            // user data len
+            batch_encoder.write_all(&0_u64.to_le_bytes()).unwrap();
+        }
     }
 
     let mut batch_bytes = batch_encoder.finish().unwrap();
@@ -384,7 +420,7 @@ fn serialize_batch<I: IntoIterator<Item = (u64, u64)>>(batch: I) -> Vec<u8> {
 fn read_frame(
     file: &mut fs::File,
     reusable_frame_buffer: &mut Vec<u8>,
-) -> io::Result<Vec<(u64, u64)>> {
+) -> io::Result<Vec<(u64, (u64, InlineArray))>> {
     let mut frame_size_buf: [u8; 8] = [0; 8];
     // TODO only break if UnexpectedEof, otherwise propagate
     fallible!(file.read_exact(&mut frame_size_buf));
@@ -425,6 +461,8 @@ fn read_frame(
 
     let mut k_buf: [u8; 8] = [0; 8];
     let mut v_buf: [u8; 8] = [0; 8];
+    let mut user_data_len_buf: [u8; 8] = [0; 8];
+    let mut user_data_buf = vec![];
     loop {
         let first_read_res = decoder.read_exact(&mut k_buf);
         if let Err(e) = first_read_res {
@@ -437,10 +475,27 @@ fn read_frame(
         decoder
             .read_exact(&mut v_buf)
             .expect("we expect reads from crc-verified buffers to succeed");
+        decoder
+            .read_exact(&mut user_data_len_buf)
+            .expect("we expect reads from crc-verified buffers to succeed");
 
         let k = u64::from_le_bytes(k_buf);
         let v = u64::from_le_bytes(v_buf);
-        ret.push((k, v));
+
+        let user_data_len_raw = u64::from_le_bytes(user_data_len_buf);
+        let user_data_len = usize::try_from(user_data_len_raw).unwrap();
+        user_data_buf.reserve(user_data_len);
+        unsafe {
+            user_data_buf.set_len(user_data_len);
+        }
+
+        decoder
+            .read_exact(&mut user_data_buf)
+            .expect("we expect reads from crc-verified buffers to succeed");
+
+        let user_data = InlineArray::from(&*user_data_buf);
+
+        ret.push((k, (v, user_data)));
     }
 
     Ok(ret)
@@ -448,7 +503,7 @@ fn read_frame(
 
 // returns the deduplicated data in this log, along with an optional offset where a
 // final torn write occurred.
-fn read_log(directory_path: &Path, lsn: u64) -> io::Result<FnvHashMap<u64, u64>> {
+fn read_log(directory_path: &Path, lsn: u64) -> io::Result<FnvHashMap<u64, (u64, InlineArray)>> {
     log::info!("reading log {lsn}");
     let mut ret = FnvHashMap::default();
 
@@ -471,16 +526,16 @@ fn read_log(directory_path: &Path, lsn: u64) -> io::Result<FnvHashMap<u64, u64>>
 fn read_snapshot(
     directory_path: &Path,
     lsn: u64,
-) -> io::Result<(FnvHashMap<u64, NonZeroU64>, u64)> {
+) -> io::Result<(FnvHashMap<u64, (NonZeroU64, InlineArray)>, u64)> {
     log::info!("reading snapshot {lsn}");
     let mut reusable_frame_buffer: Vec<u8> = vec![];
     let mut file = fallible!(fs::File::open(snapshot_path(directory_path, lsn, false)));
     let size = fallible!(file.metadata()).len();
     let raw_frame = read_frame(&mut file, &mut reusable_frame_buffer)?;
 
-    let frame: FnvHashMap<u64, NonZeroU64> = raw_frame
+    let frame: FnvHashMap<u64, (NonZeroU64, InlineArray)> = raw_frame
         .into_iter()
-        .map(|(k, v)| (k, NonZeroU64::new(v).unwrap()))
+        .map(|(k, (v, user_data))| (k, (NonZeroU64::new(v).unwrap(), user_data)))
         .collect();
 
     log::info!("recovered {} items in snapshot {}", frame.len(), lsn);
@@ -504,8 +559,8 @@ fn enumerate_logs_and_snapshot(directory_path: &Path) -> io::Result<(BTreeSet<u6
     let mut logs = BTreeSet::new();
     let mut snapshot: Option<u64> = None;
 
-    for dir_entry_res in fs::read_dir(directory_path)? {
-        let dir_entry = dir_entry_res?;
+    for dir_entry_res in fallible!(fs::read_dir(directory_path)) {
+        let dir_entry = fallible!(dir_entry_res);
         let file_name = if let Ok(f) = dir_entry.file_name().into_string() {
             f
         } else {
@@ -518,7 +573,7 @@ fn enumerate_logs_and_snapshot(directory_path: &Path) -> io::Result<(BTreeSet<u6
 
         if file_name.ends_with(TMP_SUFFIX) {
             log::warn!("removing incomplete snapshot rewrite {file_name:?}");
-            fs::remove_file(directory_path.join(file_name))?;
+            fallible!(fs::remove_file(directory_path.join(file_name)));
         } else if file_name.starts_with(LOG_PREFIX) {
             let start = LOG_PREFIX.len() + 1;
             let stop = start + 16;
@@ -539,7 +594,7 @@ fn enumerate_logs_and_snapshot(directory_path: &Path) -> io::Result<(BTreeSet<u6
                             "removing stale snapshot {id} that is superceded by snapshot {id}"
                         );
 
-                        fs::remove_file(file_name)?;
+                        fallible!(fs::remove_file(file_name));
 
                         snapshot = Some(id);
                     }
@@ -558,7 +613,7 @@ fn enumerate_logs_and_snapshot(directory_path: &Path) -> io::Result<(BTreeSet<u6
 
         log::warn!("removing stale log {file_name:?} that is contained within snapshot {snap_id}");
 
-        fs::remove_file(file_name)?;
+        fallible!(fs::remove_file(file_name));
     }
     logs.retain(|l| *l > snap_id);
 
@@ -570,40 +625,42 @@ fn read_snapshot_and_apply_logs(
     log_ids: BTreeSet<u64>,
     snapshot_id_opt: Option<u64>,
 ) -> io::Result<Recovery> {
-    let snapshot: FnvHashMap<u64, NonZeroU64> = if let Some(snapshot_id) = snapshot_id_opt {
-        read_snapshot(&path, snapshot_id)?.0
-    } else {
-        Default::default()
-    };
+    let snapshot: FnvHashMap<u64, (NonZeroU64, InlineArray)> =
+        if let Some(snapshot_id) = snapshot_id_opt {
+            read_snapshot(&path, snapshot_id)?.0
+        } else {
+            Default::default()
+        };
 
     let mut recovered = snapshot;
     let mut free = FnvHashSet::default();
 
     let mut max_log_id = snapshot_id_opt.unwrap_or(0);
 
-    let log_data_res: io::Result<Vec<(u64, FnvHashMap<u64, u64>)>> = (&log_ids) //.iter().collect::<Vec<_>>())
-        .into_par_iter()
-        .map(move |log_id| {
-            if let Some(snapshot_id) = snapshot_id_opt {
-                assert!(*log_id > snapshot_id);
-            }
+    let log_data_res: io::Result<Vec<(u64, FnvHashMap<u64, (u64, InlineArray)>)>> =
+        (&log_ids) //.iter().collect::<Vec<_>>())
+            .into_par_iter()
+            .map(move |log_id| {
+                if let Some(snapshot_id) = snapshot_id_opt {
+                    assert!(*log_id > snapshot_id);
+                }
 
-            let log_datum = read_log(&path, *log_id)?;
+                let log_datum = read_log(&path, *log_id)?;
 
-            Ok((*log_id, log_datum))
-        })
-        .collect();
+                Ok((*log_id, log_datum))
+            })
+            .collect();
 
     for (log_id, log_datum) in log_data_res? {
         max_log_id = max_log_id.max(log_id);
 
-        for (k, v) in log_datum {
+        for (k, (v, user_data)) in log_datum {
             if v == 0 {
                 free.insert(k);
                 recovered.remove(&k);
             } else {
                 free.remove(&k);
-                recovered.insert(k, NonZeroU64::new(v).unwrap());
+                recovered.insert(k, (NonZeroU64::new(v).unwrap(), user_data));
             }
         }
     }
@@ -612,12 +669,19 @@ fn read_snapshot_and_apply_logs(
 
     free.retain(|k| *k < max_key);
 
-    let mut recovered: Vec<(u64, NonZeroU64)> = recovered.into_iter().collect();
+    let mut recovered: Vec<(u64, NonZeroU64, InlineArray)> = recovered
+        .into_iter()
+        .map(|(k, (v, user_data))| (k, v, user_data))
+        .collect();
 
     recovered.par_sort_unstable();
 
     // write fresh snapshot with recovered data
-    let new_snapshot_data = serialize_batch(recovered.iter().map(|(k, v)| (*k, v.get())));
+    let new_snapshot_data = serialize_batch(
+        recovered
+            .iter()
+            .map(|(k, v, user_data)| (*k, Some((*v, user_data.clone())))),
+    );
     let snapshot_size = new_snapshot_data.len() as u64;
 
     let new_snapshot_tmp_path = snapshot_path(path, max_log_id, true);
@@ -626,9 +690,9 @@ fn read_snapshot_and_apply_logs(
     let mut snapshot_file_opts = fs::OpenOptions::new();
     snapshot_file_opts.create(true).read(false).write(true);
 
-    let mut snapshot_file = snapshot_file_opts.open(&new_snapshot_tmp_path)?;
+    let mut snapshot_file = fallible!(snapshot_file_opts.open(&new_snapshot_tmp_path));
 
-    snapshot_file.write_all(&new_snapshot_data)?;
+    fallible!(snapshot_file.write_all(&new_snapshot_data));
     drop(new_snapshot_data);
 
     fallible!(snapshot_file.sync_all());
@@ -640,13 +704,16 @@ fn read_snapshot_and_apply_logs(
 
     for log_id in &log_ids {
         let log_path = log_path(path, *log_id);
-        fs::remove_file(log_path)?;
+        fallible!(fs::remove_file(log_path));
     }
 
     if let Some(old_snapshot_id) = snapshot_id_opt {
         let old_snapshot_path = snapshot_path(path, old_snapshot_id, false);
-        fs::remove_file(old_snapshot_path)?;
+        fallible!(fs::remove_file(old_snapshot_path));
     }
+
+    let mut free: Vec<u64> = free.into_iter().collect();
+    free.par_sort_unstable();
 
     Ok(Recovery {
         recovered,
