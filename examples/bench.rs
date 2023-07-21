@@ -9,14 +9,19 @@ const N_PER_BATCH: u64 = 64 * 1024;
 fn main() {
     env_logger::init();
 
+    let before = std::time::Instant::now();
     let (db, recovered) = MetadataStore::recover("timing_test").unwrap();
 
-    dbg!(recovered.len());
+    let n = recovered.len();
+    let nps = n as u128 * 1024 * 1024 / before.elapsed().as_micros();
+    log::info!("recovered {} items ({} per second)", n, nps);
 
     for (k, v, user_data) in recovered {
         assert_eq!(k, v.get());
         assert_eq!(k, u64::from_le_bytes((*user_data).try_into().unwrap()));
     }
+
+    let before = std::time::Instant::now();
 
     for i in 0..BATCHES {
         let mut batch = Vec::with_capacity(N_PER_BATCH as usize);
@@ -31,6 +36,10 @@ fn main() {
 
         db.insert_batch(batch).unwrap();
     }
+
+    let n = BATCHES * N_PER_BATCH;
+    let nps = n as u128 * 1024 * 1024 / before.elapsed().as_micros();
+    log::info!("wrote {} items ({} per second)", n, nps);
 
     db.shutdown();
 }
