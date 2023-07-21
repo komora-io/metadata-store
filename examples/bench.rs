@@ -9,10 +9,9 @@ const N_PER_BATCH: u64 = 64 * 1024;
 fn main() {
     env_logger::init();
 
-    let (db, recovered, free) = MetadataStore::recover("timing_test").unwrap();
+    let (db, recovered) = MetadataStore::recover("timing_test").unwrap();
 
     dbg!(recovered.len());
-    dbg!(free.len());
 
     for (k, v, user_data) in recovered {
         assert_eq!(k, v.get());

@@ -9,7 +9,7 @@ use std::sync::{
 };
 
 use fault_injection::{annotate, fallible, maybe};
-use fnv::{FnvHashMap, FnvHashSet};
+use fnv::FnvHashMap;
 use inline_array::InlineArray;
 use rayon::prelude::*;
 use zstd::stream::read::Decoder as ZstdDecoder;
@@ -19,7 +19,6 @@ const WARN: &str = "DO_NOT_PUT_YOUR_FILES_HERE";
 const TMP_SUFFIX: &str = ".tmp";
 const LOG_PREFIX: &str = "log";
 const SNAPSHOT_PREFIX: &str = "snapshot";
-const HEAP_PREFIX: &str = "heap";
 
 const ZSTD_LEVEL: i32 = 3;
 
@@ -41,8 +40,6 @@ impl Drop for MetadataStore {
 
 struct Recovery {
     recovered: Vec<(u64, NonZeroU64, InlineArray)>,
-    free: Vec<u64>,
-    highest_key: u64,
     id_for_next_log: u64,
     snapshot_size: u64,
 }
@@ -233,8 +230,6 @@ impl MetadataStore {
         MetadataStore,
         // Metadata - key, value, user data
         Vec<(u64, NonZeroU64, InlineArray)>,
-        // Free keys
-        Vec<u64>,
     )> {
         use fs2::FileExt;
 
@@ -286,7 +281,6 @@ impl MetadataStore {
                 is_shut_down: false,
             },
             recovery.recovered,
-            recovery.free,
         ))
     }
 
@@ -633,7 +627,6 @@ fn read_snapshot_and_apply_logs(
         };
 
     let mut recovered = snapshot;
-    let mut free = FnvHashSet::default();
 
     let mut max_log_id = snapshot_id_opt.unwrap_or(0);
 
@@ -656,18 +649,12 @@ fn read_snapshot_and_apply_logs(
 
         for (k, (v, user_data)) in log_datum {
             if v == 0 {
-                free.insert(k);
                 recovered.remove(&k);
             } else {
-                free.remove(&k);
                 recovered.insert(k, (NonZeroU64::new(v).unwrap(), user_data));
             }
         }
     }
-
-    let max_key = recovered.iter().map(|(k, _v)| *k).max().unwrap_or(0);
-
-    free.retain(|k| *k < max_key);
 
     let mut recovered: Vec<(u64, NonZeroU64, InlineArray)> = recovered
         .into_iter()
@@ -712,13 +699,8 @@ fn read_snapshot_and_apply_logs(
         fallible!(fs::remove_file(old_snapshot_path));
     }
 
-    let mut free: Vec<u64> = free.into_iter().collect();
-    free.par_sort_unstable();
-
     Ok(Recovery {
         recovered,
-        free,
-        highest_key: max_key,
         id_for_next_log: max_log_id + 1,
         snapshot_size,
     })
