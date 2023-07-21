@@ -2,7 +2,7 @@
 name = "metadata-store"
 authors = ["Tyler Neely <tylerneely@gmail.com>"]
 description = "A simple store for recoverable metadata that is written in atomic batches."
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 license = "MIT/Apache-2.0"
 repository = "https://github.com/komora-io/metadata-store"
