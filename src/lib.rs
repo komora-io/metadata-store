@@ -5,9 +5,10 @@ use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicPtr, AtomicU64, Ordering},
-    mpsc, Arc, Mutex,
+    Arc, Mutex,
 };
 
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use fault_injection::{annotate, fallible, maybe};
 use fnv::FnvHashMap;
 use inline_array::InlineArray;
@@ -51,13 +52,11 @@ struct LogAndStats {
 }
 
 enum WorkerMessage {
-    Shutdown(mpsc::Sender<()>),
+    Shutdown(Sender<()>),
     LogReadyToCompact { log_and_stats: LogAndStats },
 }
 
-fn get_compactions(
-    rx: &mut mpsc::Receiver<WorkerMessage>,
-) -> Result<Vec<u64>, Option<mpsc::Sender<()>>> {
+fn get_compactions(rx: &mut Receiver<WorkerMessage>) -> Result<Vec<u64>, Option<Sender<()>>> {
     let mut ret = vec![];
 
     match rx.recv() {
@@ -90,7 +89,7 @@ fn get_compactions(
     }
 }
 
-fn worker(mut rx: mpsc::Receiver<WorkerMessage>, mut last_snapshot_lsn: u64, inner: Inner) {
+fn worker(mut rx: Receiver<WorkerMessage>, mut last_snapshot_lsn: u64, inner: Inner) {
     loop {
         let err_ptr: *const (io::ErrorKind, String) = inner.global_error.load(Ordering::Acquire);
 
@@ -167,7 +166,7 @@ struct Inner {
     storage_directory: PathBuf,
     #[allow(unused)]
     directory_lock: Arc<fs::File>,
-    worker_outbox: mpsc::Sender<WorkerMessage>,
+    worker_outbox: Sender<WorkerMessage>,
 }
 
 impl Drop for Inner {
@@ -187,7 +186,7 @@ impl MetadataStore {
     }
 
     fn shutdown_inner(&mut self) {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = bounded(1);
         if self
             .inner
             .worker_outbox
@@ -255,7 +254,7 @@ impl MetadataStore {
             file: fallible!(fs::File::create(log_path(path, recovery.id_for_next_log))),
         };
 
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = unbounded();
 
         let inner = Inner {
             snapshot_size: Arc::new(recovery.snapshot_size.into()),
@@ -619,7 +618,7 @@ fn read_snapshot_and_apply_logs(
     log_ids: BTreeSet<u64>,
     snapshot_id_opt: Option<u64>,
 ) -> io::Result<Recovery> {
-    let (snapshot_tx, snapshot_rx) = mpsc::channel();
+    let (snapshot_tx, snapshot_rx) = bounded(1);
     if let Some(snapshot_id) = snapshot_id_opt {
         let path: PathBuf = path.into();
         rayon::spawn(move || {
