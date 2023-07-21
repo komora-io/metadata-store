@@ -5,13 +5,14 @@ use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicPtr, AtomicU64, Ordering},
-    Arc, Mutex,
+    Arc,
 };
 
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use fault_injection::{annotate, fallible, maybe};
 use fnv::FnvHashMap;
 use inline_array::InlineArray;
+use parking_lot::Mutex;
 use rayon::prelude::*;
 use zstd::stream::read::Decoder as ZstdDecoder;
 use zstd::stream::write::Encoder as ZstdEncoder;
@@ -307,7 +308,7 @@ impl MetadataStore {
 
         let batch_bytes = serialize_batch(batch);
 
-        let mut log = self.inner.active_log.lock().unwrap();
+        let mut log = self.inner.active_log.lock();
 
         if let Err(e) = maybe!(log.file.write_all(&batch_bytes)) {
             self.set_error(&e);
