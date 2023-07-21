@@ -13,7 +13,7 @@ use std::sync::{
     mpsc, Arc, Mutex,
 };
 
-use fault_injection::{annotate, fallible};
+use fault_injection::{annotate, fallible, maybe};
 use fnv::{FnvHashMap, FnvHashSet};
 use pagetable::PageTable;
 use rayon::prelude::*;
@@ -59,7 +59,6 @@ fn get_compactions(
 
     match rx.recv() {
         Ok(WorkerMessage::Shutdown(tx)) => {
-            tx.send(()).unwrap();
             return Err(Some(tx));
         }
         Ok(WorkerMessage::LogReadyToCompact { log_and_stats }) => {
@@ -90,6 +89,13 @@ fn get_compactions(
 
 fn worker(mut rx: mpsc::Receiver<WorkerMessage>, mut last_snapshot_lsn: u64, inner: Inner) {
     loop {
+        let err_ptr: *const (io::ErrorKind, String) = inner.global_error.load(Ordering::Acquire);
+
+        if !err_ptr.is_null() {
+            log::error!("compaction thread prematurely terminating after global error set");
+            return;
+        }
+
         match get_compactions(&mut rx) {
             Ok(log_ids) => {
                 assert_eq!(log_ids[0], last_snapshot_lsn + 1);
@@ -114,6 +120,7 @@ fn worker(mut rx: mpsc::Receiver<WorkerMessage>, mut last_snapshot_lsn: u64, inn
                 }
             }
             Err(Some(tx)) => {
+                drop(inner);
                 if let Err(e) = tx.send(()) {
                     log::error!("log compactor failed to send shutdown ack to system");
                 }
@@ -167,15 +174,28 @@ impl Drop for Inner {
             unsafe {
                 drop(Box::from_raw(error_ptr));
             }
-        } else {
-            let (tx, rx) = mpsc::channel();
-            self.worker_outbox.send(WorkerMessage::Shutdown(tx));
-            rx.recv().unwrap();
         }
     }
 }
 
 impl U64Db {
+    pub fn shutdown(self) {
+        let (tx, rx) = mpsc::channel();
+        if self
+            .inner
+            .worker_outbox
+            .send(WorkerMessage::Shutdown(tx))
+            .is_ok()
+        {
+            let _ = rx.recv();
+        }
+
+        self.set_error(&io::Error::new(
+            io::ErrorKind::Other,
+            "system has been shut down".to_string(),
+        ));
+    }
+
     fn check_error(&self) -> io::Result<()> {
         let err_ptr: *const (io::ErrorKind, String) =
             self.inner.global_error.load(Ordering::Acquire);
@@ -268,18 +288,25 @@ impl U64Db {
         Ok(self.inner.pt.get(key).load(Ordering::Acquire))
     }
 
-    pub fn insert(&self, key: u64, value: u64) -> io::Result<()> {
-        self.insert_batch([(key, value)])
-    }
-
     pub fn insert_batch<I: IntoIterator<Item = (u64, u64)>>(&self, batch: I) -> io::Result<()> {
-        let batch_bytes = serialize_batch(batch);
+        self.check_error()?;
+
+        let pt_adder = batch.into_iter().map(|(k, v)| {
+            self.inner.pt.get(k).store(v, Ordering::Relaxed);
+            (k, v)
+        });
+        let batch_bytes = serialize_batch(pt_adder);
+
+        std::sync::atomic::fence(Ordering::Release);
 
         let mut log = self.inner.active_log.lock().unwrap();
 
-        self.check_error()?;
+        if let Err(e) = maybe!(log.file.write_all(&batch_bytes)) {
+            self.set_error(&e);
+            return Err(e);
+        }
 
-        if let Err(e) = log.file.write_all(&batch_bytes) {
+        if let Err(e) = maybe!(log.file.sync_all()) {
             self.set_error(&e);
             return Err(e);
         }
