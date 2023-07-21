@@ -3,7 +3,7 @@
 // TODO logs can contain 0 for value, but not the snapshot (no tombstone in last level)
 // TODO use annotate/fallible/maybe in some places where ? is used
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::num::NonZeroU64;
@@ -14,9 +14,9 @@ use std::sync::{
 };
 
 use fault_injection::{annotate, fallible};
-//use fnv::{BTreeMap, FnvHashSet};
-use fnv::FnvHashSet;
+use fnv::{FnvHashMap, FnvHashSet};
 use pagetable::PageTable;
+use rayon::prelude::*;
 use zstd::stream::read::Decoder as ZstdDecoder;
 use zstd::stream::write::Encoder as ZstdEncoder;
 
@@ -34,7 +34,7 @@ pub struct U64Db {
 }
 
 struct Recovery {
-    recovered: BTreeMap<u64, NonZeroU64>,
+    recovered: Vec<(u64, NonZeroU64)>,
     free: FnvHashSet<u64>,
     highest_key: u64,
     id_for_next_log: u64,
@@ -237,7 +237,7 @@ impl U64Db {
         };
 
         let worker_inner = inner.clone();
-        let worker_join_handle = std::thread::spawn(move || {
+        std::thread::spawn(move || {
             worker(
                 rx,
                 recovery.id_for_next_log.checked_sub(1).unwrap(),
@@ -357,7 +357,7 @@ fn serialize_batch<I: IntoIterator<Item = (u64, u64)>>(batch: I) -> Vec<u8> {
 fn read_frame(
     file: &mut fs::File,
     reusable_frame_buffer: &mut Vec<u8>,
-) -> io::Result<BTreeMap<u64, u64>> {
+) -> io::Result<Vec<(u64, u64)>> {
     let mut frame_size_buf: [u8; 8] = [0; 8];
     // TODO only break if UnexpectedEof, otherwise propagate
     fallible!(file.read_exact(&mut frame_size_buf));
@@ -391,7 +391,7 @@ fn read_frame(
         )));
     }
 
-    let mut ret = BTreeMap::default();
+    let mut ret = vec![];
 
     let mut decoder = ZstdDecoder::new(&reusable_frame_buffer[8..len + 8])
         .expect("failed to create zstd decoder");
@@ -413,7 +413,7 @@ fn read_frame(
 
         let k = u64::from_le_bytes(k_buf);
         let v = u64::from_le_bytes(v_buf);
-        ret.insert(k, v);
+        ret.push((k, v));
     }
 
     Ok(ret)
@@ -421,9 +421,9 @@ fn read_frame(
 
 // returns the deduplicated data in this log, along with an optional offset where a
 // final torn write occurred.
-fn read_log(directory_path: &Path, lsn: u64) -> io::Result<BTreeMap<u64, u64>> {
+fn read_log(directory_path: &Path, lsn: u64) -> io::Result<FnvHashMap<u64, u64>> {
     log::info!("reading log {lsn}");
-    let mut ret = BTreeMap::default();
+    let mut ret = FnvHashMap::default();
 
     let mut file = fallible!(fs::File::open(log_path(directory_path, lsn)));
 
@@ -441,14 +441,17 @@ fn read_log(directory_path: &Path, lsn: u64) -> io::Result<BTreeMap<u64, u64>> {
 }
 
 /// returns the data from the snapshot as well as the size of the snapshot
-fn read_snapshot(directory_path: &Path, lsn: u64) -> io::Result<(BTreeMap<u64, NonZeroU64>, u64)> {
+fn read_snapshot(
+    directory_path: &Path,
+    lsn: u64,
+) -> io::Result<(FnvHashMap<u64, NonZeroU64>, u64)> {
     log::info!("reading snapshot {lsn}");
     let mut reusable_frame_buffer: Vec<u8> = vec![];
     let mut file = fallible!(fs::File::open(snapshot_path(directory_path, lsn, false)));
     let size = fallible!(file.metadata()).len();
     let raw_frame = read_frame(&mut file, &mut reusable_frame_buffer)?;
 
-    let frame: BTreeMap<u64, NonZeroU64> = raw_frame
+    let frame: FnvHashMap<u64, NonZeroU64> = raw_frame
         .into_iter()
         .map(|(k, v)| (k, NonZeroU64::new(v).unwrap()))
         .collect();
@@ -540,7 +543,7 @@ fn read_snapshot_and_apply_logs(
     log_ids: BTreeSet<u64>,
     snapshot_id_opt: Option<u64>,
 ) -> io::Result<Recovery> {
-    let snapshot: BTreeMap<u64, NonZeroU64> = if let Some(snapshot_id) = snapshot_id_opt {
+    let snapshot: FnvHashMap<u64, NonZeroU64> = if let Some(snapshot_id) = snapshot_id_opt {
         read_snapshot(&path, snapshot_id)?.0
     } else {
         Default::default()
@@ -551,16 +554,23 @@ fn read_snapshot_and_apply_logs(
 
     let mut max_log_id = snapshot_id_opt.unwrap_or(0);
 
-    for log_id in &log_ids {
-        if let Some(snapshot_id) = snapshot_id_opt {
-            assert!(*log_id > snapshot_id);
-        }
+    let log_data_res: io::Result<Vec<(u64, FnvHashMap<u64, u64>)>> = (&log_ids) //.iter().collect::<Vec<_>>())
+        .into_par_iter()
+        .map(move |log_id| {
+            if let Some(snapshot_id) = snapshot_id_opt {
+                assert!(*log_id > snapshot_id);
+            }
 
-        let log_data = read_log(&path, *log_id)?;
+            let log_datum = read_log(&path, *log_id)?;
 
-        max_log_id = max_log_id.max(*log_id);
+            Ok((*log_id, log_datum))
+        })
+        .collect();
 
-        for (k, v) in log_data {
+    for (log_id, log_datum) in log_data_res? {
+        max_log_id = max_log_id.max(log_id);
+
+        for (k, v) in log_datum {
             if v == 0 {
                 free.insert(k);
                 recovered.remove(&k);
@@ -574,6 +584,10 @@ fn read_snapshot_and_apply_logs(
     let max_key = recovered.iter().map(|(k, _v)| *k).max().unwrap_or(0);
 
     free.retain(|k| *k < max_key);
+
+    let mut recovered: Vec<(u64, NonZeroU64)> = recovered.into_iter().collect();
+
+    recovered.par_sort_unstable();
 
     // write fresh snapshot with recovered data
     let new_snapshot_data = serialize_batch(recovered.iter().map(|(k, v)| (*k, v.get())));

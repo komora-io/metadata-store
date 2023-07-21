@@ -12,6 +12,7 @@ fnv = "1.0.7"
 fs2 = "0.4.3"
 log = "0.4.19"
 pagetable = "0.4.3"
+rayon = "1.7.0"
 zstd = "0.12.4"
 
 [dev-dependencies]
